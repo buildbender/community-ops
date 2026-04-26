@@ -1,0 +1,31 @@
+# Environment & secrets
+.env
+*.env
+
+# Live database — contains real member data
+calls.db
+
+# Sentiment log — real data
+sentiment_log.json
+
+# Exports (generated files)
+calls_export.csv
+calls_export.json
+
+# macOS launchd plist — system-specific, contains local paths
+com.rv.calltracker.plist
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
