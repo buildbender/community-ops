@@ -1,6 +1,15 @@
 """
-call_tracker.py — RV Member Call Tracker
+call_tracker.py — RV Member Call Tracker V2
 Listens to Discord channels for explicit investment calls and stores them in SQLite.
+
+V2 changes:
+- Added #hive-chat to monitored channels
+- Removed hardcoded CRYPTO_SYMBOLS set (fully dynamic via GPT)
+- Timeframe tagging: maps raw timeframe to short/medium/long/unspecified
+- Resolution window: maps timeframe_tag to 7d/30d/None
+- Asset class mapping from GPT asset_type
+- Ticker consensus alert: posts when 3+ members call same ticker+direction same day
+- status='open' on insert
 """
 
 import os
@@ -15,46 +24,33 @@ import requests
 from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 from openai import AsyncOpenAI
 
 # ─────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────
 
-DISCORD_TOKEN   = os.environ.get("DISCORD_TOKEN", "")
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-CMC_API_KEY     = os.environ.get("COINMARKETCAP_API_KEY", "")
+DISCORD_TOKEN   = os.getenv("DISCORD_TOKEN", "")
+OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+CMC_API_KEY     = os.getenv("COINMARKETCAP_API_KEY", "")
 
 DB_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calls.db")
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "call_tracker.log")
 
 GUILD_ID = 921411652115644436
 
+# V2: 4 monitored channels (added #hive-chat)
 MONITORED_CHANNELS = {
     "928036731410849902": "pro-chat",
     "927678002135973918": "crypto",
     "1027573555975688223": "degen",
+    "1232495023300546581": "hive-chat",
 }
 
-CRYPTO_SYMBOLS = {
-    # Layer 1s / majors
-    "BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "ADA", "DOT", "ATOM", "NEAR",
-    "APT", "SUI", "TON", "TRX", "FTM", "ALGO",
-    # DeFi
-    "LINK", "UNI", "AAVE", "MKR", "CRV", "LDO", "PENDLE", "GMX",
-    "ARB", "OP", "JUP", "ORCA", "RAY", "JTO",
-    # Perp DEXes
-    "HYPE", "EDGE",
-    # Meme / culture
-    "DOGE", "SHIB", "PEPE", "WIF", "BONK", "BOME", "POPCAT", "MEW",
-    # NFT tokens
-    "PENGU", "BLUR", "LOOKS",
-    # AI / infra
-    "RENDER", "FET", "AGIX", "IO", "AKT", "WLD",
-    # Other notable
-    "IMX", "INJ", "SEI", "TIA", "PYTH", "DRIFT", "KMNO",
-}
+# Delivery channels for alerts (Community Summary + real-time alerts)
+DELIVERY_CHANNELS = ["928036731410849902", "1232495023300546581"]
 
 ROLE_LEVEL_MAP = {
     "All Access": "all_access",
@@ -70,16 +66,37 @@ Rules:
 - Buying/long/calls/adding = bullish. Shorting/puts/selling = bearish. \
 Watching/researching = null.
 - Ticker must be a real asset (stock, crypto, ETF, or commodity). Ignore memes/jokes about non-assets.
-- Stocks and ETFs are valid (e.g. NVDA, TSLA, DRAM, AEHR, HIMZ, SPY, QQQ).
+- Stocks and ETFs are valid (e.g. NVDA, TSLA, SPY, QQQ, GLD, TLT).
 - Crypto tokens are valid regardless of whether they are well-known (e.g. HYPE, EDGE, PENGU, JUP).
 - Extract the ticker symbol only — NOT the full name. e.g. "EdgeX" -> "EDGE", "Hyperliquid" -> "HYPE".
-- Extract timeframe ONLY if explicitly stated.
+- Extract timeframe ONLY if explicitly stated (raw string, no interpretation).
 - High confidence: clear buy/sell statement with named ticker. Medium: ambiguous. Low: vague.
 
 Return JSON only:
 {"has_call": true/false, "ticker": "SYMBOL or null", "direction": "bullish|bearish|null", \
 "timeframe": "string or null", "confidence": "high|medium|low", "asset_type": "crypto|stock|etf|commodity|unknown"}\
 """
+
+# Timeframe keyword sets for tagging
+TIMEFRAME_SHORT_KW      = {"today", "this week", "next few days", "intraday", "swing", "scalp",
+                            "short term", "short-term", "eod", "end of day", "24h", "48h", "quick"}
+TIMEFRAME_BIWEEKLY_KW  = {"2 weeks", "two weeks", "14d", "14 days", "biweekly", "bi-weekly",
+                            "couple weeks", "next two weeks"}
+TIMEFRAME_MEDIUM_KW    = {"this month", "end of month", "next month", "few weeks",
+                            "medium term", "medium-term", "monthly", "weeks", "30d", "30 days"}
+TIMEFRAME_QUARTERLY_KW = {"3 months", "three months", "quarter", "quarterly", "q1", "q2", "q3", "q4",
+                            "3m", "90d", "90 days", "next quarter"}
+TIMEFRAME_LONG_KW      = {"long term", "long-term", "cycle", "accumulating", "accumulate",
+                            "dca", "next year", "multi month", "multi-month", "hold", "holding",
+                            "position", "year"}
+
+ASSET_CLASS_MAP = {
+    "crypto":    "crypto",
+    "stock":     "equity",
+    "etf":       "etf",
+    "commodity": "commodity",
+    "unknown":   "crypto",
+}
 
 # ─────────────────────────────────────────────
 # Logging setup
@@ -106,11 +123,54 @@ def setup_logging() -> logging.Logger:
 log = setup_logging()
 
 # ─────────────────────────────────────────────
+# Timeframe tagging
+# ─────────────────────────────────────────────
+
+def tag_timeframe(raw: str | None) -> tuple[str, int | None]:
+    """Map raw timeframe string to (timeframe_tag, resolution_window).
+
+    Resolution windows:
+      short      ->  7d
+      biweekly   -> 14d
+      medium     -> 30d
+      quarterly  -> 90d
+      long       -> None (open-ended, resolves at 90d)
+      unspecified->  7d (default)
+    """
+    if not raw:
+        return "unspecified", 7
+
+    tf = raw.lower().strip()
+
+    for kw in TIMEFRAME_SHORT_KW:
+        if kw in tf:
+            return "short", 7
+
+    for kw in TIMEFRAME_BIWEEKLY_KW:
+        if kw in tf:
+            return "biweekly", 14
+
+    for kw in TIMEFRAME_MEDIUM_KW:
+        if kw in tf:
+            return "medium", 30
+
+    for kw in TIMEFRAME_QUARTERLY_KW:
+        if kw in tf:
+            return "quarterly", 90
+
+    for kw in TIMEFRAME_LONG_KW:
+        if kw in tf:
+            return "long", None
+
+    return "unspecified", 7
+
+# ─────────────────────────────────────────────
 # Database helpers
 # ─────────────────────────────────────────────
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -150,6 +210,9 @@ def insert_call(
     message_id: str,
     channel_id: str,
     timestamp: int,
+    timeframe_tag: str,
+    resolution_window: int | None,
+    asset_class: str,
 ) -> bool:
     """Returns True if inserted, False if duplicate."""
     try:
@@ -157,15 +220,16 @@ def insert_call(
             conn.execute(
                 """INSERT INTO calls
                    (member_id, username, ticker, direction, timeframe,
-                    price_at_call, message_id, channel_id, timestamp)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    price_at_call, message_id, channel_id, timestamp,
+                    timeframe_tag, resolution_window, asset_class, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
                 (member_id, username, ticker, direction, timeframe,
-                 price, message_id, channel_id, timestamp),
+                 price, message_id, channel_id, timestamp,
+                 timeframe_tag, resolution_window, asset_class),
             )
         return True
     except sqlite3.IntegrityError:
         return False  # duplicate message_id
-
 
 # ─────────────────────────────────────────────
 # Price lookup
@@ -221,7 +285,7 @@ def get_hyperliquid_price(symbol: str) -> float | None:
 
 
 def get_coingecko_price(symbol: str) -> float | None:
-    """CoinGecko search fallback — tries to match symbol to a coin id."""
+    """CoinGecko search fallback."""
     try:
         resp = requests.get(
             f"https://api.coingecko.com/api/v3/search?query={symbol}",
@@ -230,7 +294,6 @@ def get_coingecko_price(symbol: str) -> float | None:
         results = resp.json().get("coins", [])
         if not results:
             return None
-        # Use first result that matches symbol exactly
         for coin in results[:3]:
             if coin.get("symbol", "").upper() == symbol.upper():
                 price_resp = requests.get(
@@ -246,38 +309,28 @@ def get_coingecko_price(symbol: str) -> float | None:
         return None
 
 
-def get_price(ticker: str, asset_type: str = "unknown") -> float | None:
-    """Price lookup chain depending on asset type.
-    crypto/unknown: CMC → Hyperliquid → CoinGecko → Polygon
-    stock/etf:      Polygon → CMC (in case it's also a crypto ticker)
-    """
-    if asset_type in ("stock", "etf"):
-        # Stocks/ETFs: go straight to Polygon
+def get_price(ticker: str, asset_class: str = "crypto") -> float | None:
+    """Price lookup chain depending on asset class."""
+    if asset_class in ("equity", "etf"):
         price = get_stock_price(ticker)
         if price:
             return price
-        # Some tickers overlap (e.g. LINK is also a stock), try crypto as fallback
         price = get_crypto_price(ticker)
         if price:
             return price
         return None
 
-    # Crypto or unknown
-    if ticker in CRYPTO_SYMBOLS:
-        price = get_crypto_price(ticker)
-        if price:
-            return price
-    # Hyperliquid — great coverage for newer/Solana tokens
+    # Crypto or commodity
+    price = get_crypto_price(ticker)
+    if price:
+        return price
     price = get_hyperliquid_price(ticker)
     if price:
         return price
-    # CoinGecko search fallback
     price = get_coingecko_price(ticker)
     if price:
         return price
-    # Last resort: maybe it's a stock
     return get_stock_price(ticker)
-
 
 # ─────────────────────────────────────────────
 # Member role resolution
@@ -289,15 +342,12 @@ def resolve_member_level(member: discord.Member) -> str:
             return ROLE_LEVEL_MAP[role.name]
     return "general"
 
-
 # ─────────────────────────────────────────────
 # GPT call parser
 # ─────────────────────────────────────────────
 
 async def parse_call(content: str, client: AsyncOpenAI) -> dict | None:
-    """
-    Returns parsed dict if has_call=True and confidence=high, else None.
-    """
+    """Returns parsed dict if has_call=True and confidence=high, else None."""
     try:
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
@@ -317,6 +367,55 @@ async def parse_call(content: str, client: AsyncOpenAI) -> dict | None:
         log.error(f"GPT parse error: {exc}")
     return None
 
+# ─────────────────────────────────────────────
+# Alert helpers
+# ─────────────────────────────────────────────
+
+async def post_to_channels(content: str, channel_ids: list[str], token: str):
+    """Post a message to multiple Discord channels via REST API."""
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as session:
+        for channel_id in channel_ids:
+            try:
+                await session.post(
+                    f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                    headers=headers,
+                    json={"content": content},
+                )
+            except Exception as exc:
+                log.warning(f"Failed to post alert to channel {channel_id}: {exc}")
+
+
+async def check_ticker_consensus(ticker: str, direction: str):
+    """Post consensus alert when exactly 3 same-ticker same-direction calls happen today."""
+    today_start = int(datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+    with get_db() as conn:
+        row = conn.execute(
+            """SELECT COUNT(DISTINCT member_id) as cnt, AVG(price_at_call) as avg_price
+               FROM calls
+               WHERE ticker = ? AND direction = ? AND timestamp >= ?""",
+            (ticker, direction, today_start)
+        ).fetchone()
+
+    count     = row["cnt"] if row else 0
+    avg_price = row["avg_price"] if row else None
+
+    if count != 3:  # Only fire at exactly 3 to avoid re-alerting
+        return
+
+    if direction == "bullish":
+        msg = f"📡 Community Consensus: **{ticker}**\n{count} members went bullish on {ticker} today."
+    else:
+        msg = f"📡 Community Fade: **{ticker}**\n{count} members went bearish on {ticker} today."
+
+    if avg_price:
+        msg += f"\nEntry avg: ${avg_price:,.2f}"
+    msg += "\n`/leaderboard` to see who's calling it."
+
+    await post_to_channels(msg, DELIVERY_CHANNELS, DISCORD_TOKEN)
+    log.info(f"Ticker consensus alert posted: {ticker} {direction} (count={count})")
 
 # ─────────────────────────────────────────────
 # Core processing
@@ -350,7 +449,12 @@ async def process_message(
 
     ticker = ticker.upper()
 
-    log.info(f"Call detected: {ticker} ({asset_type}) {direction} by {author_name} in #{MONITORED_CHANNELS.get(channel_id, channel_id)}")
+    # V2: tag timeframe and determine resolution window
+    timeframe_tag, resolution_window = tag_timeframe(timeframe)
+    asset_class = ASSET_CLASS_MAP.get(asset_type, "crypto")
+
+    log.info(f"Call detected: {ticker} ({asset_class}) {direction} [{timeframe_tag}] "
+             f"by {author_name} in #{MONITORED_CHANNELS.get(channel_id, channel_id)}")
 
     # Resolve member level
     level = "general"
@@ -364,12 +468,12 @@ async def process_message(
 
     upsert_member(author_id, author_name, level)
 
-    # Price lookup (non-blocking; failure is tolerated)
-    price = await asyncio.get_event_loop().run_in_executor(
-        None, get_price, ticker, asset_type
-    )
+    # Fetch price at time of call (run in thread pool to avoid blocking event loop)
+    price = await asyncio.to_thread(get_price, ticker, asset_class)
+    if price is None:
+        log.warning(f"Could not fetch price for {ticker}, storing call without price")
 
-    stored = insert_call(
+    inserted = insert_call(
         member_id=author_id,
         username=author_name,
         ticker=ticker,
@@ -379,61 +483,46 @@ async def process_message(
         message_id=message_id,
         channel_id=channel_id,
         timestamp=timestamp,
+        timeframe_tag=timeframe_tag,
+        resolution_window=resolution_window,
+        asset_class=asset_class,
     )
 
-    if stored:
-        log.info(f"Stored call #{message_id}: {ticker} {direction} @{price} ({level})")
+    if inserted:
+        log.info(f"Stored call: {ticker} {direction} @ {price} (timeframe: {timeframe_tag}, window: {resolution_window}d)")
+        # Check ticker consensus after insert
+        await check_ticker_consensus(ticker, direction)
     else:
-        log.debug(f"Duplicate message {message_id}, skipped")
-
+        log.info(f"Duplicate message {message_id}, skipping")
 
 # ─────────────────────────────────────────────
-# Backfill helpers
+# Backfill helper
 # ─────────────────────────────────────────────
 
-async def fetch_messages_after(
-    channel_id: str,
-    after_id: str,
-    token: str,
-) -> list[dict]:
-    """
-    Paginate Discord REST API to fetch all messages after after_id.
-    Returns messages in chronological order.
-    """
+async def fetch_messages_after(channel_id: str, after_id: str, token: str) -> list[dict]:
+    """Fetch messages after a given message ID using Discord REST API."""
     headers = {"Authorization": f"Bot {token}"}
-    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
-    all_messages: list[dict] = []
+    messages = []
     last_id = after_id
-    retry_after = 1.0
 
     async with aiohttp.ClientSession() as session:
         while True:
+            url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
             params = {"after": last_id, "limit": 100}
             async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status == 429:
-                    data = await resp.json()
-                    wait = data.get("retry_after", retry_after)
-                    log.warning(f"Rate limited on backfill, waiting {wait}s")
-                    await asyncio.sleep(wait)
-                    retry_after = min(retry_after * 2, 60)
-                    continue
-
                 if resp.status != 200:
-                    log.error(f"Discord API error {resp.status} fetching channel {channel_id}")
                     break
-
-                retry_after = 1.0
-                batch: list[dict] = await resp.json()
-
+                batch = await resp.json()
                 if not batch:
                     break
-
-                # Discord returns newest-first; reverse to chronological
                 batch.sort(key=lambda m: int(m["id"]))
-                all_messages.extend(batch)
+                messages.extend(batch)
                 last_id = batch[-1]["id"]
+                if len(batch) < 100:
+                    break
+                await asyncio.sleep(0.5)
 
-    return all_messages
+    return messages
 
 
 async def backfill_channel(
@@ -455,7 +544,6 @@ async def backfill_channel(
     log.info(f"Backfill: {len(messages)} missed messages in #{channel_name}")
 
     for msg in messages:
-        # Skip bots
         if msg.get("author", {}).get("bot"):
             continue
 
@@ -474,11 +562,9 @@ async def backfill_channel(
             openai_client=openai_client,
         )
 
-        # Track progress in case of crash mid-backfill
         set_meta(meta_key, msg["id"])
 
     log.info(f"Backfill complete for #{channel_name}")
-
 
 # ─────────────────────────────────────────────
 # Discord bot
@@ -491,26 +577,37 @@ class CallTrackerBot(discord.Client):
         intents.members = True
         super().__init__(intents=intents)
         self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        """Register slash commands on startup."""
+        from slash_commands import register_commands
+        register_commands(self.tree)
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        log.info("Slash commands synced")
 
     async def on_ready(self):
         log.info(f"Bot connected as {self.user} (id={self.user.id})")
 
         guild = self.get_guild(GUILD_ID)
         if guild is None:
-            log.error(f"Guild {GUILD_ID} not found — check bot is in the server")
+            log.error(f"Guild {GUILD_ID} not found")
             return
 
-        # Backfill missed messages for each monitored channel
-        for channel_id in MONITORED_CHANNELS:
-            try:
-                await backfill_channel(channel_id, guild, self.openai_client)
-            except Exception as exc:
-                log.error(f"Backfill error for channel {channel_id}: {exc}")
+        async def run_backfills():
+            for channel_id in MONITORED_CHANNELS:
+                try:
+                    await backfill_channel(channel_id, guild, self.openai_client)
+                except Exception as exc:
+                    log.error(f"Backfill error for channel {channel_id}: {exc}")
+            log.info("Backfill complete for all channels.")
 
+        asyncio.create_task(run_backfills())
         log.info("Listening for new messages ...")
 
     async def on_message(self, message: discord.Message):
-        # Skip bots
         if message.author.bot:
             return
 
@@ -535,12 +632,10 @@ class CallTrackerBot(discord.Client):
             openai_client=self.openai_client,
         )
 
-        # Update the backfill anchor
         set_meta(f"last_processed_{channel_id}", str(message.id))
 
     async def on_error(self, event_method: str, *args, **kwargs):
         log.exception(f"Unhandled error in {event_method}")
-
 
 # ─────────────────────────────────────────────
 # Entrypoint
@@ -554,7 +649,7 @@ def main():
         log.error("OPENAI_API_KEY is not set — exiting")
         sys.exit(1)
 
-    log.info("Starting RV Call Tracker ...")
+    log.info("Starting RV Call Tracker V2 ...")
     bot = CallTrackerBot()
 
     try:
